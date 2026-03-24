@@ -17,27 +17,45 @@
 
 ## 🚀 Быстрый старт
 
-### 1. Установка
+### 1. Клонирование
 
 ```bash
+git clone https://github.com/abaykopenov/rag-llm.git
 cd rag-llm
+```
+
+### 2. Установка
+
+**Windows (PowerShell):**
+```powershell
+# Разрешить скрипты (одноразово)
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
+
 python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # Linux/Mac
+venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Настройка API ключей
+**Linux / Mac:**
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+> ⏳ Первая установка занимает 5-10 минут (Docling тянет PyTorch, ~1.4 ГБ)
+
+### 3. Настройка API ключей
 
 ```bash
 cp .env.example .env
 ```
 
-Заполни API ключи в `.env`:
-- **Gemini** (бесплатно): https://aistudio.google.com/apikey
-- **Jina Reranker** (бесплатно): https://jina.ai/reranker/
+Заполни API ключи в `.env` (оба бесплатные):
+- **Gemini** (LLM + Embeddings): https://aistudio.google.com/apikey
+- **Jina** (Reranker): https://jina.ai/reranker/
 
-### 3. Запуск
+### 4. Запуск
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
