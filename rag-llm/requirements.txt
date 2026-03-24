@@ -1,0 +1,29 @@
+# RAG-LLM Dependencies
+# Обновлено: 2026-03-21
+# Все версии проверены на актуальность
+
+# === Backend ===
+fastapi>=0.135.0            # SSE support, Pydantic V3 integration
+uvicorn[standard]>=0.34.0   # ASGI сервер с HTTP/2
+pydantic>=2.10.0            # 50x быстрее с Rust-backed core
+pydantic-settings>=2.13.0   # Конфигурация через env vars
+
+# === HTTP ===
+httpx>=0.28.0               # Async HTTP клиент с HTTP/2
+
+# === Парсинг документов ===
+docling>=2.80.0             # IBM: PDF/DOCX/PPTX парсинг + HybridChunker
+                            # Heron layout model, VLM support, OCR
+
+# === Векторная БД ===
+chromadb>=1.0.0             # v2 API, Rust backend, sparse vectors
+
+# === Мониторинг ===
+psutil>=6.1.0               # CPU, RAM, диск, сеть
+pynvml>=12.0.0              # NVIDIA GPU метрики
+
+# === Логирование ===
+loguru>=0.7.3               # Структурное логирование
+
+# === Утилиты ===
+python-multipart>=0.0.18    # Загрузка файлов через multipart/form-data
