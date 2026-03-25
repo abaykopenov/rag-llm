@@ -15,6 +15,7 @@ from app.config import settings
 from app.core.embedder import embedder
 from app.core.indexer import indexer
 from app.core.reranker import reranker
+from app.core.query_rewriter import query_rewriter, rrf_merge
 from app.models.document import RetrievedChunk, ChunkMetadata
 from app.utils.logging import get_logger
 
@@ -36,30 +37,21 @@ class Retriever:
         section: str | None = None,
         # Hybrid search
         keywords: list[str] | None = None,
+        # History для query rewriting
+        history: list[dict] | None = None,
     ) -> list[RetrievedChunk]:
         """Найти релевантные чанки.
 
         Pipeline:
-        1. Embed вопроса
-        2. Cosine search в ChromaDB (с metadata фильтрами)
-        3. Keyword search (если hybrid включён)
-        4. Merge результатов (RRF — Reciprocal Rank Fusion)
-        5. Reranking (если включён)
-        6. Parent-child resolution
-        7. Фильтрация по score threshold
-
-        Args:
-            query: Вопрос пользователя
-            collection: Имя коллекции для поиска
-            top_k: Количество результатов
-            score_threshold: Минимальный score
-            document_id: Фильтр по ID документа
-            element_type: Фильтр по типу элемента (text, table, code, list)
-            section: Фильтр по секции (подстрока в заголовке)
-            keywords: Ключевые слова для hybrid search
-
-        Returns:
-            Список найденных чанков с релевантностью
+        1. Query Rewriting (переформулирует вопрос)
+        2. Multi-Query (генерирует варианты запроса)
+        3. Embed вопроса
+        4. Cosine search в ChromaDB (с metadata фильтрами)
+        5. Keyword search (если hybrid включён)
+        6. Merge результатов (RRF — Reciprocal Rank Fusion)
+        7. Reranking (если включён)
+        8. Parent-child resolution
+        9. Фильтрация по score threshold
         """
         top_k = top_k or settings.retrieval_top_k
         score_threshold = score_threshold if score_threshold is not None else settings.retrieval_score_threshold
@@ -68,57 +60,58 @@ class Retriever:
 
         start = time.perf_counter()
 
-        # --- Metadata фильтр для ChromaDB ---
+        # --- 0. Query Rewriting ---
+        search_query = query
+        if settings.query_rewrite_enabled:
+            try:
+                search_query = await query_rewriter.rewrite(query, history=history)
+            except Exception as e:
+                log.warning("Query rewrite failed, using original: {}", e)
+
+        # --- 1. Multi-Query или одиночный поиск ---
         where = self._build_where_filter(document_id, element_type)
 
-        # 1. Получаем embedding вопроса
-        query_embedding = await embedder.embed_query(query)
-        embed_time = time.perf_counter() - start
+        if settings.multi_query_enabled:
+            results = await self._multi_query_search(
+                search_query, collection, top_k, where, section, keywords,
+            )
+        else:
+            # Одиночный поиск (как раньше)
+            query_embedding = await embedder.embed_query(search_query)
 
-        # 2. Vector search (cosine similarity)
-        search_top_k = top_k * 3 if (settings.reranker_enabled or keywords) else top_k
+            search_top_k = top_k * 3 if (settings.reranker_enabled or keywords) else top_k
 
-        search_start = time.perf_counter()
+            where_document = None
+            if section:
+                where_document = {"$contains": section}
 
-        # Keyword filter через where_document (если секция задана)
-        where_document = None
-        if section:
-            where_document = {"$contains": section}
-
-        results = indexer.query(
-            collection_name=collection,
-            query_embedding=query_embedding,
-            top_k=search_top_k,
-            where=where,
-            where_document=where_document,
-        )
-        search_time = time.perf_counter() - search_start
-
-        # 3. Hybrid search: keyword + vector merge
-        keyword_time = 0.0
-        if keywords:
-            keyword_start = time.perf_counter()
-            results = self._hybrid_merge(
-                vector_results=results,
-                query_keywords=keywords,
-                collection=collection,
+            results = indexer.query(
+                collection_name=collection,
+                query_embedding=query_embedding,
                 top_k=search_top_k,
                 where=where,
+                where_document=where_document,
             )
-            keyword_time = time.perf_counter() - keyword_start
 
-        # 4. Reranking (если включён)
-        rerank_time = 0.0
+            # Hybrid search: keyword + vector merge
+            if keywords:
+                results = self._hybrid_merge(
+                    vector_results=results,
+                    query_keywords=keywords,
+                    collection=collection,
+                    top_k=search_top_k,
+                    where=where,
+                )
+
+        # --- Reranking (если включён) ---
         if settings.reranker_enabled and results:
-            rerank_start = time.perf_counter()
             results = await reranker.rerank(query, results, top_n=top_k)
-            rerank_time = time.perf_counter() - rerank_start
 
-        # 5. Parent-child resolution
+        # --- Parent-child resolution ---
         if settings.parent_child_enabled:
             results = self._resolve_parents(results, collection)
 
-        # 6. Фильтруем по score и создаём RetrievedChunk
+        # --- Фильтруем по score и создаём RetrievedChunk ---
         chunks = []
         for item in results[:top_k]:
             score = item.get("score", 0)
@@ -141,20 +134,48 @@ class Retriever:
                 ))
 
         total_ms = (time.perf_counter() - start) * 1000
-
-        log.info(
-            "Retrieval завершён: {} найдено, {} после фильтра, "
-            "embed={:.0f}мс, search={:.0f}мс, keyword={:.0f}мс, rerank={:.0f}мс, total={:.0f}мс",
-            len(results),
-            len(chunks),
-            embed_time * 1000,
-            search_time * 1000,
-            keyword_time * 1000,
-            rerank_time * 1000,
-            total_ms,
-        )
+        log.info("Retrieval завершён: {} найдено, {} после фильтра, {:.0f}мс", len(results), len(chunks), total_ms)
 
         return chunks
+
+    # ═══════════════════════════════════════════════════════
+    # Multi-Query Search
+    # ═══════════════════════════════════════════════════════
+
+    async def _multi_query_search(
+        self,
+        query: str,
+        collection: str,
+        top_k: int,
+        where: dict | None,
+        section: str | None,
+        keywords: list[str] | None,
+    ) -> list[dict]:
+        """Multi-Query Retrieval: генерируем 3 варианта запроса, ищем по каждому, объединяем через RRF."""
+        import asyncio
+
+        queries = await query_rewriter.generate_multi_queries(query)
+        search_top_k = top_k * 2
+
+        where_document = {"$contains": section} if section else None
+
+        # Параллельный поиск по всем вариантам
+        async def search_one(q: str):
+            q_embedding = await embedder.embed_query(q)
+            return indexer.query(
+                collection_name=collection,
+                query_embedding=q_embedding,
+                top_k=search_top_k,
+                where=where,
+                where_document=where_document,
+            )
+
+        all_results = await asyncio.gather(*[search_one(q) for q in queries])
+
+        # RRF merge
+        merged = rrf_merge(list(all_results))
+        log.info("Multi-query: {} запросов, {} уникальных чанков", len(queries), len(merged))
+        return merged
 
     # ═══════════════════════════════════════════════════════
     # Metadata фильтры

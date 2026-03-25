@@ -15,12 +15,18 @@ log = get_logger("generator")
 class Generator:
     """Сборка prompt из контекста и генерация ответа."""
 
-    def build_prompt(self, query: str, chunks: list[RetrievedChunk]) -> list[dict]:
+    def build_prompt(
+        self,
+        query: str,
+        chunks: list[RetrievedChunk],
+        history: list[dict] | None = None,
+    ) -> list[dict]:
         """Собрать prompt для LLM.
 
         Args:
             query: Вопрос пользователя
             chunks: Найденные чанки
+            history: Предыдущие сообщения [{"role": "user", "content": "..."}]
 
         Returns:
             Список messages для LLM API
@@ -45,17 +51,26 @@ class Generator:
                 "role": "system",
                 "content": settings.system_prompt,
             },
-            {
-                "role": "user",
-                "content": (
-                    f"Контекст из документов:\n\n{context}\n\n"
-                    f"---\n\n"
-                    f"Вопрос: {query}"
-                ),
-            },
         ]
 
-        log.info("Prompt собран: {} чанков, {} символов контекста", len(chunks), len(context))
+        # Добавляем историю диалога (если есть)
+        if history:
+            messages.extend(history)
+
+        # Текущий вопрос с контекстом
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Контекст из документов:\n\n{context}\n\n"
+                f"---\n\n"
+                f"Вопрос: {query}"
+            ),
+        })
+
+        log.info(
+            "Prompt собран: {} чанков, {} символов контекста, {} history msgs",
+            len(chunks), len(context), len(history) if history else 0,
+        )
 
         return messages
 
@@ -65,6 +80,7 @@ class Generator:
         chunks: list[RetrievedChunk],
         temperature: float | None = None,
         max_tokens: int | None = None,
+        history: list[dict] | None = None,
     ) -> "GenerationResult":
         """Сгенерировать ответ по вопросу с контекстом.
 
@@ -73,6 +89,7 @@ class Generator:
             chunks: Найденные чанки
             temperature: Температура генерации
             max_tokens: Максимум токенов
+            history: История диалога для multi-turn
 
         Returns:
             GenerationResult с ответом и метаданными
@@ -80,7 +97,7 @@ class Generator:
         start = time.perf_counter()
 
         # 1. Собираем prompt
-        messages = self.build_prompt(query, chunks)
+        messages = self.build_prompt(query, chunks, history=history)
 
         # Сохраняем prompt для прозрачности
         full_prompt = "\n".join(

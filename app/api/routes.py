@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.api.schemas import (
@@ -27,6 +28,12 @@ from app.api.schemas import (
     EvalRequest,
     EvalResponse,
     EvalMetricResult,
+    # Stage 6: Chat
+    ChatRequest,
+    ChatResponse,
+    ChatMessageInfo,
+    SessionInfo,
+    SessionDetailResponse,
 )
 from app.core.parser import parser
 from app.core.chunker import chunker
@@ -38,6 +45,7 @@ from app.models.document import Document
 from app.utils.logging import get_logger
 from app.utils.monitoring import get_system_stats
 from app.utils.document_store import document_store
+from app.utils.session_store import session_store
 
 log = get_logger("api")
 
@@ -191,13 +199,14 @@ async def get_document_summary(document_id: str):
     if doc.summary:
         return {"document_id": document_id, "summary": doc.summary, "cached": True}
 
-    # Пробуем сгенерировать
-    if not doc.raw_text:
+    # Получаем текст: из памяти или с диска
+    text = doc.raw_text or _load_document_text(document_id)
+    if not text:
         raise HTTPException(status_code=400, detail="Текст документа не сохранён")
 
     try:
         from app.core.summarizer import summarizer
-        summary = await summarizer.summarize(doc.raw_text, doc.filename)
+        summary = await summarizer.summarize(text, doc.filename)
         if summary:
             doc.summary = summary
             document_store.save(doc)
@@ -630,3 +639,219 @@ async def evaluate_rag(request: EvalRequest):
         eval_time_ms=round(report.eval_time_ms, 1),
     )
 
+
+# =====================================================
+# Stage 6: Conversational RAG
+# =====================================================
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Чат с RAG — с историей диалога.
+
+    1. Создаёт или загружает сессию
+    2. Ищет релевантные чанки по вопросу
+    3. Собирает prompt с историей + контекстом
+    4. Генерирует ответ
+    5. Сохраняет сообщения в сессию
+    """
+    from app.utils.tracer import tracer
+
+    total_start = time.perf_counter()
+
+    # 1. Сессия: загрузить или создать
+    if request.session_id:
+        session = session_store.get(request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Сессия '{request.session_id}' не найдена")
+    else:
+        session = session_store.create(collection=request.collection)
+
+    trace_id = tracer.start_trace("chat", request.message)
+    log.info(
+        "Chat: session={}, msg='{}' (collection='{}', history={})",
+        session.id, request.message[:60], session.collection, session.message_count,
+    )
+
+    try:
+        # 2. Retrieval
+        retrieval_start = time.perf_counter()
+        chunks = await retriever.retrieve(
+            query=request.message,
+            collection=session.collection,
+            top_k=request.top_k,
+        )
+        retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
+
+        # 3. История диалога
+        history = session.get_history(max_pairs=5)
+
+        # 4. Генерация с историей
+        if chunks:
+            result = await generator.generate(
+                query=request.message,
+                chunks=chunks,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                history=history,
+            )
+            answer = result.answer
+            model = result.model
+            tokens = result.total_tokens
+        else:
+            answer = "В загруженных документах не найдено релевантной информации по вашему вопросу."
+            model = ""
+            tokens = 0
+
+        total_ms = (time.perf_counter() - total_start) * 1000
+
+        # 5. Сохраняем сообщения в сессию
+        session.add_message("user", request.message)
+        session.add_message(
+            "assistant", answer,
+            chunks_used=len(chunks),
+            model=model,
+            tokens_used=tokens,
+        )
+        session_store.save(session)
+
+        tracer.end_trace(trace_id, "completed")
+
+        chunks_info = [
+            ChunkInfo(
+                id=c.id, text=c.text, score=c.score,
+                page=c.metadata.page, section=c.metadata.section,
+            )
+            for c in chunks
+        ]
+
+        return ChatResponse(
+            session_id=session.id,
+            answer=answer,
+            chunks_used=chunks_info,
+            model=model,
+            tokens_used=tokens,
+            message_count=session.message_count,
+            timing={
+                "retrieval_ms": round(retrieval_ms, 1),
+                "total_ms": round(total_ms, 1),
+                "trace_id": trace_id,
+            },
+        )
+
+    except Exception as e:
+        tracer.end_trace(trace_id, "error")
+        raise
+
+
+@router.get("/sessions", response_model=list[SessionInfo])
+async def list_sessions():
+    """Список всех сессий диалога."""
+    return [
+        SessionInfo(
+            id=s.id,
+            title=s.title,
+            collection=s.collection,
+            message_count=s.message_count,
+            created_at=s.created_at.isoformat(),
+            updated_at=s.updated_at.isoformat(),
+        )
+        for s in session_store.get_all()
+    ]
+
+
+@router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
+async def get_session(session_id: str):
+    """Получить полную историю сессии."""
+    session = session_store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Сессия '{session_id}' не найдена")
+
+    return SessionDetailResponse(
+        id=session.id,
+        title=session.title,
+        collection=session.collection,
+        messages=[
+            ChatMessageInfo(
+                role=m.role,
+                content=m.content,
+                timestamp=m.timestamp.isoformat(),
+                chunks_used=m.chunks_used,
+                model=m.model,
+                tokens_used=m.tokens_used,
+            )
+            for m in session.messages
+        ],
+        created_at=session.created_at.isoformat(),
+        updated_at=session.updated_at.isoformat(),
+    )
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Удалить сессию."""
+    if not session_store.delete(session_id):
+        raise HTTPException(status_code=404, detail=f"Сессия '{session_id}' не найдена")
+    return {"status": "deleted", "session_id": session_id}
+
+
+@router.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """Streaming чат с RAG — Server-Sent Events.
+
+    Ответ приходит по частям в формате SSE:
+    data: {"delta": "часть текста"}
+    data: {"delta": "", "done": true, "session_id": "...", "message_count": 4}
+    """
+    import json as json_module
+    from app.core.llm_router import llm_router
+
+    # 1. Сессия
+    if request.session_id:
+        session = session_store.get(request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Сессия '{request.session_id}' не найдена")
+    else:
+        session = session_store.create(collection=request.collection)
+
+    # 2. Retrieval
+    chunks = await retriever.retrieve(
+        query=request.message,
+        collection=session.collection,
+        top_k=request.top_k,
+    )
+
+    # 3. Prompt с историей
+    history = session.get_history(max_pairs=5)
+    messages = generator.build_prompt(request.message, chunks, history=history)
+
+    async def event_generator():
+        full_answer = []
+        try:
+            async for delta in llm_router.generate_stream(
+                messages=messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            ):
+                full_answer.append(delta)
+                yield f"data: {json_module.dumps({'delta': delta}, ensure_ascii=False)}\n\n"
+
+            # Финальный event
+            answer = "".join(full_answer)
+            session.add_message("user", request.message)
+            session.add_message("assistant", answer, chunks_used=len(chunks))
+            session_store.save(session)
+
+            yield f"data: {json_module.dumps({'delta': '', 'done': True, 'session_id': session.id, 'message_count': session.message_count}, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            yield f"data: {json_module.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

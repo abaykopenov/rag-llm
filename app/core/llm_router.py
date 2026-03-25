@@ -162,6 +162,52 @@ class LLMRouter:
             generation_time_ms=elapsed_ms,
         )
 
+    async def generate_stream(
+        self,
+        messages: list[dict],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ):
+        """Streaming генерация — yields текст по кусочкам.
+
+        Yields:
+            str: Очередной фрагмент текста
+        """
+        client = await self._get_client()
+
+        payload = {
+            "model": model or self.model,
+            "messages": messages,
+            "temperature": temperature if temperature is not None else settings.llm_temperature,
+            "max_tokens": max_tokens or settings.llm_max_tokens,
+            "stream": True,
+        }
+
+        log.info(
+            "LLM stream запрос: model={}, messages={}",
+            payload["model"], len(messages),
+        )
+
+        async with client.stream("POST", "/chat/completions", json=payload) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]  # убираем "data: "
+                if data_str.strip() == "[DONE]":
+                    break
+
+                import json
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+                except (json.JSONDecodeError, IndexError):
+                    continue
+
     async def close(self):
         """Закрыть HTTP клиент."""
         if self._client and not self._client.is_closed:

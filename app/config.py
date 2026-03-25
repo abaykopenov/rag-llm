@@ -95,6 +95,18 @@ class Settings(BaseSettings):
     )
 
     # === Парсинг и Чанкинг ===
+    parser_mode: str = Field(
+        default="gemini",
+        description="Режим парсинга: gemini (облако), docling (локально), vision (Vision LLM)"
+    )
+    vision_llm_base_url: str = Field(
+        default="",
+        description="Base URL для Vision LLM (для parser_mode=vision)"
+    )
+    vision_llm_model: str = Field(
+        default="Qwen2-VL-72B-Instruct",
+        description="Модель Vision LLM"
+    )
     upload_dir: str = Field(
         default="./data/uploads",
         description="Директория для загруженных файлов"
@@ -107,6 +119,10 @@ class Settings(BaseSettings):
         default=512,
         description="Максимальный размер чанка в токенах"
     )
+    chunk_overlap_tokens: int = Field(
+        default=64,
+        description="Перекрытие чанков в токенах (0 = без overlap)"
+    )
 
     # === Retrieval ===
     retrieval_top_k: int = Field(
@@ -116,6 +132,14 @@ class Settings(BaseSettings):
     retrieval_score_threshold: float = Field(
         default=0.0,
         description="Минимальный score для включения чанка (0.0 = без фильтра)"
+    )
+    query_rewrite_enabled: bool = Field(
+        default=True,
+        description="Включить переформулирование запросов через LLM"
+    )
+    multi_query_enabled: bool = Field(
+        default=False,
+        description="Включить Multi-Query Retrieval (3 варианта запроса)"
     )
 
     # === Reranker ===

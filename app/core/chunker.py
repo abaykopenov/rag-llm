@@ -259,7 +259,8 @@ class DocumentChunker:
         return merged
 
     def _split_by_paragraphs(self, text: str, max_chars: int) -> list[str]:
-        """Разбить длинный текст по абзацам (\\n\\n)."""
+        """Разбить длинный текст по абзацам (\\n\\n) с overlap."""
+        overlap_chars = settings.chunk_overlap_tokens * CHARS_PER_TOKEN
         paragraphs = text.split("\n\n")
         chunks = []
         current = ""
@@ -270,7 +271,12 @@ class DocumentChunker:
             else:
                 if current:
                     chunks.append(current)
-                current = para
+                # Overlap: берём последние N символов предыдущего чанка
+                if overlap_chars > 0 and current:
+                    overlap_text = current[-overlap_chars:]
+                    current = overlap_text + "\n\n" + para
+                else:
+                    current = para
 
         if current:
             chunks.append(current)

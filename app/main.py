@@ -8,9 +8,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.api.routes import router
+from app.api.openai_compat import router as openai_router
 from app.core.embedder import embedder
 from app.core.llm_router import llm_router
 from app.utils.logging import setup_logging, get_logger
@@ -67,8 +69,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS — разрешаем запросы от любых клиентов
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Подключаем роуты
 app.include_router(router, prefix="/api")
+app.include_router(openai_router)  # /v1/chat/completions
 
 
 @app.get("/")
@@ -79,4 +91,6 @@ async def root():
         "version": settings.app_version,
         "docs": "/docs",
         "api": "/api",
+        "openai_compat": "/v1/chat/completions",
     }
+
