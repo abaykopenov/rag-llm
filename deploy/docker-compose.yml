@@ -1,0 +1,129 @@
+# =============================================================
+#  RAG-LLM — Docker Compose для GX10 (локальный деплой)
+#
+#  Запуск: docker compose up -d
+#  Статус: docker compose ps
+#  Логи:   docker compose logs -f vllm-llm
+# =============================================================
+
+services:
+  # ─────────────────────────────────────────────
+  #  vLLM — LLM генерация (текст)
+  #  Модель: Qwen2.5-72B-Instruct
+  #  VRAM: ~50 ГБ (q8)
+  # ─────────────────────────────────────────────
+  vllm-llm:
+    image: vllm/vllm-openai:latest
+    container_name: rag-vllm-llm
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ${MODEL_CACHE:-./models}:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+    command: >
+      --model Qwen/Qwen2.5-72B-Instruct
+      --tensor-parallel-size 2
+      --max-model-len 16384
+      --gpu-memory-utilization 0.90
+      --dtype auto
+      --trust-remote-code
+      --served-model-name qwen2.5-72b
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+  # ─────────────────────────────────────────────
+  #  vLLM — Vision LLM (для парсинга документов)
+  #  Модель: Qwen2-VL-72B-Instruct
+  #  VRAM: ~50 ГБ (q8)
+  #
+  #  ⚠ Запускайте ОДНОВРЕМЕННО с vllm-llm только
+  #  если суммарная VRAM ≥ 100 ГБ.
+  #  Иначе — переключайте модели вручную.
+  # ─────────────────────────────────────────────
+  vllm-vision:
+    image: vllm/vllm-openai:latest
+    container_name: rag-vllm-vision
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ${MODEL_CACHE:-./models}:/root/.cache/huggingface
+    ports:
+      - "8002:8000"
+    command: >
+      --model Qwen/Qwen2-VL-72B-Instruct
+      --tensor-parallel-size 2
+      --max-model-len 8192
+      --gpu-memory-utilization 0.90
+      --dtype auto
+      --trust-remote-code
+      --served-model-name qwen2-vl-72b
+      --limit-mm-per-prompt image=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    profiles:
+      - vision  # Запускается только с: docker compose --profile vision up
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+  # ─────────────────────────────────────────────
+  #  RAG-LLM API сервер
+  #  Подключается к vLLM как бэкенду
+  # ─────────────────────────────────────────────
+  rag-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: rag-llm-api
+    ports:
+      - "8000:8000"
+      - "50051:50051"
+    volumes:
+      - ../data:/app/data
+    environment:
+      # LLM -> vLLM
+      - RAG_LLM_PROVIDER=vllm
+      - RAG_LLM_BASE_URL=http://vllm-llm:8000/v1
+      - RAG_LLM_MODEL=qwen2.5-72b
+      - RAG_LLM_API_KEY=local
+      # Embedding -> vLLM
+      - RAG_EMBEDDING_PROVIDER=openai
+      - RAG_EMBEDDING_BASE_URL=http://vllm-llm:8000/v1
+      - RAG_EMBEDDING_MODEL=qwen2.5-72b
+      - RAG_EMBEDDING_API_KEY=local
+      # Reranker -> отключён (vLLM не поддерживает /rerank)
+      - RAG_RERANKER_ENABLED=false
+      # Parser -> Vision (если vision profile включён)
+      - RAG_PARSER_MODE=${PARSER_MODE:-docling}
+      - RAG_VISION_LLM_BASE_URL=http://vllm-vision:8000/v1
+      - RAG_VISION_LLM_MODEL=qwen2-vl-72b
+    depends_on:
+      vllm-llm:
+        condition: service_healthy
+    restart: unless-stopped

@@ -18,7 +18,8 @@ grpcio-reflection>=1.62.0   # Server reflection (grpcurl discovery)
 protobuf>=4.25.0            # Protocol Buffers
 
 # === Парсинг документов ===
-docling>=2.80.0             # IBM: PDF/DOCX/PPTX парсинг + HybridChunker
+google-genai>=1.0.0           # Gemini SDK для парсинга PDF в облаке
+docling>=2.80.0             # IBM: PDF/DOCX/PPTX парсинг (локально, optional)
 
 # === Векторная БД ===
 chromadb>=1.0.0             # v2 API, Rust backend, sparse vectors
@@ -32,4 +33,4 @@ loguru>=0.7.3               # Структурное логирование
 
 # === Утилиты ===
 python-multipart>=0.0.18    # Загрузка файлов через multipart/form-data
-
+PyMuPDF>=1.25.0             # PDF → PNG рендер для Vision LLM парсинга

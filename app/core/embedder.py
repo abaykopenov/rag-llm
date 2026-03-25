@@ -1,5 +1,8 @@
 """
-Embedding клиент — генерация векторов через vLLM или OpenAI-совместимый API.
+Embedding клиент — генерация векторов.
+Поддерживает два режима:
+  1. gemini — нативный Gemini SDK (google-genai)
+  2. openai — OpenAI-совместимый API (vLLM, OpenAI, Jina, etc.)
 """
 
 import asyncio
@@ -30,7 +33,73 @@ class Embedder:
         self.base_url = (base_url or settings.embedding_base_url).rstrip("/")
         self.api_key = api_key or settings.embedding_api_key
         self.model = model or settings.embedding_model
+        self.provider = settings.embedding_provider
         self._client: Optional[httpx.AsyncClient] = None
+        self._genai_client = None
+
+    # ─────────────────────────────────────────────────
+    # Gemini Native SDK (рекомендуемый)
+    # ─────────────────────────────────────────────────
+
+    def _get_genai_client(self):
+        """Lazy init клиента google-genai."""
+        if self._genai_client is None:
+            from google import genai
+            api_key = self.api_key or settings.llm_api_key
+            self._genai_client = genai.Client(api_key=api_key)
+            log.info("Gemini embedding клиент инициализирован")
+        return self._genai_client
+
+    async def _embed_with_gemini(self, texts: list[str]) -> list[list[float]]:
+        """Embedding через Gemini нативный SDK.
+
+        Использует client.models.embed_content() — поддерживает batching.
+        """
+        client = self._get_genai_client()
+        all_embeddings = []
+
+        # Gemini поддерживает batch до ~100 текстов
+        batch_size = 50
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    # Запускаем синхронный SDK в executor
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda b=batch: client.models.embed_content(
+                            model=self.model,
+                            contents=b,
+                        )
+                    )
+                    # Извлекаем векторы
+                    for emb in result.embeddings:
+                        all_embeddings.append(list(emb.values))
+                    break
+
+                except Exception as e:
+                    error_str = str(e)
+                    if ("429" in error_str or "RESOURCE_EXHAUSTED" in error_str) and attempt < MAX_RETRIES:
+                        wait = 30 * attempt
+                        log.warning(
+                            "Gemini embedding rate limit (попытка {}/{}). Ждём {} сек...",
+                            attempt, MAX_RETRIES, wait
+                        )
+                        await asyncio.sleep(wait)
+                    elif attempt < MAX_RETRIES:
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        log.warning("Gemini embedding ошибка (попытка {}/{}): {}", attempt, MAX_RETRIES, e)
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+
+        return all_embeddings
+
+    # ─────────────────────────────────────────────────
+    # OpenAI-compatible API (vLLM, OpenAI, Jina, etc.)
+    # ─────────────────────────────────────────────────
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Lazy init HTTP клиента."""
@@ -45,104 +114,76 @@ class Embedder:
             )
         return self._client
 
-    async def _request_with_retry(self, path: str, payload: dict) -> dict:
-        """Выполнить HTTP запрос с retry и экспоненциальным backoff.
-
-        Args:
-            path: URL путь (например, "/embeddings")
-            payload: JSON тело запроса
-
-        Returns:
-            Ответ API в формате dict
-
-        Raises:
-            ConnectionError: Если все попытки исчерпаны
-        """
+    async def _embed_with_openai(self, texts: list[str]) -> list[list[float]]:
+        """Embedding через OpenAI-совместимый API."""
         client = await self._get_client()
-        last_error = None
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = await client.post(path, json=payload)
-                response.raise_for_status()
-                return response.json()
-
-            except httpx.ConnectError as e:
-                last_error = e
-                if attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    log.warning(
-                        "Embedding API недоступен (попытка {}/{}), повтор через {:.1f}с: {}",
-                        attempt, MAX_RETRIES, delay, self.base_url,
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    log.error("Embedding API недоступен после {} попыток: {}", MAX_RETRIES, self.base_url)
-                    raise ConnectionError(
-                        f"Не удалось подключиться к Embedding API по адресу {self.base_url} "
-                        f"после {MAX_RETRIES} попыток. Убедитесь, что сервер запущен."
-                    ) from e
-
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code >= 500 and attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    log.warning(
-                        "Embedding API ошибка {} (попытка {}/{}), повтор через {:.1f}с",
-                        e.response.status_code, attempt, MAX_RETRIES, delay,
-                    )
-                    await asyncio.sleep(delay)
-                    last_error = e
-                else:
-                    raise
-
-            except httpx.TimeoutException as e:
-                last_error = e
-                if attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    log.warning(
-                        "Embedding API timeout (попытка {}/{}), повтор через {:.1f}с",
-                        attempt, MAX_RETRIES, delay,
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    log.error("Embedding API timeout после {} попыток", MAX_RETRIES)
-                    raise
-
-        raise last_error  # На случай непредвиденного выхода из цикла
-
-    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Получить embeddings для списка текстов.
-
-        Args:
-            texts: Список текстов для embedding
-
-        Returns:
-            Список embedding-векторов
-        """
-        if not texts:
-            return []
-
-        log.info("Embedding запрос: {} текстов, model={}", len(texts), self.model)
-        start = time.perf_counter()
-
-        # Разбиваем на батчи (API может иметь лимит)
-        batch_size = 32
         all_embeddings = []
+        batch_size = 32
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-
             payload = {
                 "model": self.model,
                 "input": batch,
             }
 
-            data = await self._request_with_retry("/embeddings", payload)
+            last_error = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    response = await client.post("/embeddings", json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+                    sorted_data = sorted(data["data"], key=lambda x: x["index"])
+                    batch_embeddings = [item["embedding"] for item in sorted_data]
+                    all_embeddings.extend(batch_embeddings)
+                    break
+                except httpx.ConnectError as e:
+                    last_error = e
+                    if attempt < MAX_RETRIES:
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        log.warning(
+                            "Embedding API недоступен (попытка {}/{}), повтор через {:.1f}с",
+                            attempt, MAX_RETRIES, delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        raise ConnectionError(
+                            f"Не удалось подключиться к Embedding API: {self.base_url}"
+                        ) from e
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code >= 500 and attempt < MAX_RETRIES:
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        log.warning("Embedding API ошибка {}, повтор...", e.response.status_code)
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+                except httpx.TimeoutException as e:
+                    if attempt < MAX_RETRIES:
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        log.warning("Embedding API timeout, повтор...")
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
 
-            # Сортируем по индексу (API может вернуть в другом порядке)
-            sorted_data = sorted(data["data"], key=lambda x: x["index"])
-            batch_embeddings = [item["embedding"] for item in sorted_data]
-            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+
+    # ─────────────────────────────────────────────────
+    # Публичный интерфейс
+    # ─────────────────────────────────────────────────
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Получить embeddings для списка текстов."""
+        if not texts:
+            return []
+
+        log.info("Embedding запрос: {} текстов, provider={}, model={}",
+                 len(texts), self.provider, self.model)
+        start = time.perf_counter()
+
+        if self.provider == "gemini":
+            all_embeddings = await self._embed_with_gemini(texts)
+        else:
+            all_embeddings = await self._embed_with_openai(texts)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -156,14 +197,7 @@ class Embedder:
         return all_embeddings
 
     async def embed_query(self, text: str) -> list[float]:
-        """Получить embedding для одного текста (вопроса).
-
-        Args:
-            text: Текст вопроса
-
-        Returns:
-            Embedding вектор
-        """
+        """Получить embedding для одного текста (вопроса)."""
         result = await self.embed_texts([text])
         return result[0]
 
@@ -175,4 +209,3 @@ class Embedder:
 
 # Глобальный экземпляр
 embedder = Embedder()
-

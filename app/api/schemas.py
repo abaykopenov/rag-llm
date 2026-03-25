@@ -162,3 +162,57 @@ class EvalResponse(BaseModel):
     grade: str = Field("", description="Буквенная оценка: A/B/C/D/F")
     results: list[EvalMetricResult]
     eval_time_ms: float
+
+
+# === Stage 6: Conversational RAG ===
+
+class ChatRequest(BaseModel):
+    """Запрос в чат с историей."""
+    message: str = Field(..., description="Сообщение пользователя", min_length=1)
+    session_id: Optional[str] = Field(None, description="ID сессии (если нет — создаётся новая)")
+    collection: str = Field(default="default", description="Коллекция для RAG")
+    top_k: Optional[int] = Field(default=None, description="Количество чанков")
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(default=None)
+
+
+class ChatMessageInfo(BaseModel):
+    """Сообщение в истории сессии."""
+    role: str
+    content: str
+    timestamp: Optional[str] = None
+    chunks_used: int = 0
+    model: str = ""
+    tokens_used: int = 0
+
+
+class ChatResponse(BaseModel):
+    """Ответ чата."""
+    session_id: str
+    answer: str
+    chunks_used: list[ChunkInfo] = Field(default_factory=list)
+    model: str = ""
+    tokens_used: int = 0
+    message_count: int = Field(0, description="Всего сообщений в сессии")
+    timing: dict = Field(default_factory=dict)
+
+
+class SessionInfo(BaseModel):
+    """Краткая информация о сессии."""
+    id: str
+    title: str
+    collection: str
+    message_count: int
+    created_at: str
+    updated_at: str
+
+
+class SessionDetailResponse(BaseModel):
+    """Полная информация о сессии с историей."""
+    id: str
+    title: str
+    collection: str
+    messages: list[ChatMessageInfo]
+    created_at: str
+    updated_at: str
+
