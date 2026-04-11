@@ -49,3 +49,4 @@ desktop.ini
 .agents/
 .gemini/
 skills-lock.json
+data/

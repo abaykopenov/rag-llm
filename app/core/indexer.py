@@ -77,6 +77,7 @@ class Indexer:
         metadatas = [
             {
                 "document_id": c.document_id,
+                "filename": getattr(c.metadata, 'filename', '') or "",  # Добавляем filename
                 "page": c.metadata.page or 0,
                 "section": c.metadata.section or "",
                 "element_type": c.metadata.element_type or "text",

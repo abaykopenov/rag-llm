@@ -41,6 +41,7 @@ from app.core.embedder import embedder
 from app.core.indexer import indexer
 from app.core.retriever import retriever
 from app.core.generator import generator
+from app.core.text_cleaner import clean_parsed_text, clean_chunk_text
 from app.models.document import Document
 from app.utils.logging import get_logger
 from app.utils.monitoring import get_system_stats
@@ -122,14 +123,22 @@ async def upload_document(
         # 2. Парсим (асинхронно — не блокирует event loop)
         parse_result = await parser.parse_async(file_path)
         doc.pages_count = parse_result.pages_count
-        doc.raw_text = parse_result.full_text
 
-        # 3. Сохраняем извлечённый текст на диск (для Stage 2: GET /documents/{id}/text)
-        _save_document_text(doc.id, parse_result.full_text)
-        log.info("Текст сохранён: {} символов", len(parse_result.full_text))
+        # 3. Пост-обработка текста (удаление колонтитулов, номеров страниц, склейка строк)
+        cleaned_text = clean_parsed_text(parse_result.full_text)
+        doc.raw_text = cleaned_text
 
-        # 4. Чанкинг
+        # 4. Сохраняем очищенный текст на диск
+        _save_document_text(doc.id, cleaned_text)
+        log.info("Текст сохранён: {} символов", len(cleaned_text))
+
+        # 5. Чанкинг
         chunks = chunker.chunk(parse_result.docling_document, doc.id)
+        # Пост-обработка каждого чанка
+        for c in chunks:
+            c.text = clean_chunk_text(c.text)
+        # Убираем пустые чанки после очистки
+        chunks = [c for c in chunks if c.text and len(c.text.strip()) > 10]
         doc.chunks_count = len(chunks)
 
         if not chunks:
@@ -138,6 +147,10 @@ async def upload_document(
         # 5. Embeddings
         texts = [c.text for c in chunks]
         embeddings = await embedder.embed_texts(texts)
+
+        # Добавляем filename в метаданные чанков для поиска
+        for c in chunks:
+            c.metadata.filename = doc.filename
 
         # 6. Индексация в ChromaDB
         indexer.add_chunks(collection, chunks, embeddings)
@@ -317,6 +330,58 @@ async def query_documents(request: QueryRequest):
     except Exception as e:
         tracer.end_trace(trace_id, "error")
         raise
+
+
+# ═══════════════════════════════════════════════════════════════
+# Retrieve-only endpoint (без LLM генерации)
+# ═══════════════════════════════════════════════════════════════
+
+@router.post("/retrieve")
+async def retrieve_chunks(request: QueryRequest):
+    """Поиск релевантных чанков БЕЗ LLM-генерации.
+
+    Полезно когда клиент (например SCORM-генератор) хочет:
+    1. Получить только чанки (контекст)
+    2. Самостоятельно построить промпт
+    3. Вызвать LLM напрямую (Ollama/vLLM)
+
+    Включает query rewrite если настроен.
+    """
+    total_start = time.perf_counter()
+
+    log.info("Retrieve: '{}' (collection='{}', top_k={})",
+             request.question[:80], request.collection, request.top_k)
+
+    chunks = await retriever.retrieve(
+        query=request.question,
+        collection=request.collection,
+        top_k=request.top_k,
+        document_id=request.document_id,
+        element_type=request.element_type,
+        section=request.section,
+        keywords=request.keywords,
+    )
+
+    retrieval_ms = (time.perf_counter() - total_start) * 1000
+
+    chunks_info = [
+        ChunkInfo(
+            id=c.id,
+            text=c.text,
+            score=c.score,
+            page=c.metadata.page,
+            section=c.metadata.section,
+        )
+        for c in chunks
+    ]
+
+    return {
+        "chunks": chunks_info,
+        "total": len(chunks_info),
+        "collection": request.collection,
+        "query": request.question,
+        "timing_ms": round(retrieval_ms, 1),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
