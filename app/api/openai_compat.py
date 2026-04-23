@@ -17,7 +17,7 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Request, Header
+from fastapi import APIRouter, Depends, Request, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -26,10 +26,16 @@ from app.core.retriever import retriever
 from app.core.generator import generator
 from app.core.llm_router import llm_router
 from app.utils.logging import get_logger
+from app.utils.security import require_api_key
 
 log = get_logger("openai_compat")
 
-router = APIRouter(prefix="/v1", tags=["OpenAI Compatible"])
+# OpenAI-compat endpoints тоже под X-API-Key, если в конфиге задан ключ.
+router = APIRouter(
+    prefix="/v1",
+    tags=["OpenAI Compatible"],
+    dependencies=[Depends(require_api_key)],
+)
 
 
 # === Pydantic Models (OpenAI format) ===

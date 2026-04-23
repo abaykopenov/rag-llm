@@ -31,8 +31,8 @@ data/chroma/
 data/sessions.json
 data/documents.json
 
-# Models cache
-models/
+# Models cache (ML weights — только корневая models/, не app/models/)
+/models/
 *.gguf
 *.safetensors
 

@@ -3,11 +3,10 @@ API endpoints для RAG-LLM.
 """
 
 import time
-import shutil
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Depends
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
@@ -47,10 +46,17 @@ from app.utils.logging import get_logger
 from app.utils.monitoring import get_system_stats
 from app.utils.document_store import document_store
 from app.utils.session_store import session_store
+from app.utils.security import (
+    require_api_key,
+    sanitize_filename,
+    save_upload_with_size_limit,
+)
 
 log = get_logger("api")
 
-router = APIRouter()
+# Все /api/* эндпоинты требуют X-API-Key, если в конфиге задан хотя бы один ключ.
+# Для unauthed liveness/readiness probes используй /health и /ready на уровне app.
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 
 # === Вспомогательные функции ===
@@ -93,32 +99,44 @@ async def upload_document(
     """
     total_start = time.perf_counter()
 
-    # Валидация формата файла
+    # Санитизация имени файла (защита от path traversal и control-chars)
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Имя файла обязательно")
+    safe_name = sanitize_filename(file.filename)
+
+    # Валидация формата файла (по уже санитизированному имени)
     try:
-        parser.validate_file_extension(file.filename)
+        parser.validate_file_extension(safe_name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    log.info("Загрузка файла: {} ({:.1f} MB)", file.filename, (file.size or 0) / (1024 * 1024))
+    log.info(
+        "Загрузка файла: {} (original={}, {:.1f} MB)",
+        safe_name, file.filename, (file.size or 0) / (1024 * 1024),
+    )
 
-    # Создаём документ
+    # Создаём документ (храним санитизированное имя)
     doc = Document(
-        filename=file.filename,
+        filename=safe_name,
         file_size=file.size or 0,
         collection=collection,
         status="processing",
     )
 
     try:
-        # 1. Сохраняем файл
+        # 1. Сохраняем файл потоково, проверяя размер по ходу
         upload_dir = Path(settings.upload_dir)
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        file_path = upload_dir / f"{doc.id}_{file.filename}"
+        file_path = upload_dir / f"{doc.id}_{safe_name}"
 
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        max_bytes = (
+            settings.max_upload_size_mb * 1024 * 1024
+            if settings.max_upload_size_mb > 0
+            else 0
+        )
+        written = await save_upload_with_size_limit(file, file_path, max_bytes)
+        doc.file_size = written  # реальный размер после записи
 
-        log.info("Файл сохранён: {}", file_path)
+        log.info("Файл сохранён: {} ({} байт)", file_path, written)
 
         # 2. Парсим (асинхронно — не блокирует event loop)
         parse_result = await parser.parse_async(file_path)
@@ -324,6 +342,11 @@ async def query_documents(request: QueryRequest):
                 "llm_ms": round(result.llm_time_ms, 1),
                 "total_ms": round(total_ms, 1),
                 "trace_id": trace_id,
+                # Cache-метрики провайдера (0 если провайдер их не вернул
+                # или кеш не сработал — см. llm_router._parse_cache_stats).
+                "cached_prompt_tokens": result.cached_prompt_tokens,
+                "cache_creation_tokens": result.cache_creation_tokens,
+                "cache_hit_ratio": round(result.cache_hit_ratio, 3),
             },
         )
 
@@ -762,10 +785,16 @@ async def chat(request: ChatRequest):
             answer = result.answer
             model = result.model
             tokens = result.total_tokens
+            cached_tokens = result.cached_prompt_tokens
+            cache_creation = result.cache_creation_tokens
+            cache_ratio = result.cache_hit_ratio
         else:
             answer = "В загруженных документах не найдено релевантной информации по вашему вопросу."
             model = ""
             tokens = 0
+            cached_tokens = 0
+            cache_creation = 0
+            cache_ratio = 0.0
 
         total_ms = (time.perf_counter() - total_start) * 1000
 
@@ -800,6 +829,9 @@ async def chat(request: ChatRequest):
                 "retrieval_ms": round(retrieval_ms, 1),
                 "total_ms": round(total_ms, 1),
                 "trace_id": trace_id,
+                "cached_prompt_tokens": cached_tokens,
+                "cache_creation_tokens": cache_creation,
+                "cache_hit_ratio": round(cache_ratio, 3),
             },
         )
 

@@ -173,12 +173,84 @@ class DocumentParser:
     # ─────────────────────────────────────────────────
 
     def _get_docling_converter(self):
-        """Lazy init конвертера Docling (тяжёлый импорт)."""
+        """Lazy init конвертера Docling с полным PdfPipelineOptions.
+
+        Настраивает OCR (EasyOCR), TableFormer, accelerator (CPU/CUDA/MPS/AUTO),
+        таймаут. Параметры берутся из settings.docling_*.
+        """
         if self._docling_converter is None:
-            log.info("Инициализация Docling DocumentConverter...")
-            from docling.document_converter import DocumentConverter
-            self._docling_converter = DocumentConverter()
-            log.info("Docling готов")
+            log.info("Инициализация Docling DocumentConverter (с PdfPipelineOptions)...")
+
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import (
+                PdfPipelineOptions,
+                TableStructureOptions,
+                TableFormerMode,
+                EasyOcrOptions,
+            )
+            from docling.datamodel.accelerator_options import (
+                AcceleratorDevice,
+                AcceleratorOptions,
+            )
+
+            opts = PdfPipelineOptions(
+                do_ocr=settings.docling_do_ocr,
+                do_table_structure=settings.docling_do_table_structure,
+            )
+
+            if settings.docling_do_table_structure:
+                mode = (
+                    TableFormerMode.ACCURATE
+                    if settings.docling_table_mode.lower() == "accurate"
+                    else TableFormerMode.FAST
+                )
+                opts.table_structure_options = TableStructureOptions(
+                    do_cell_matching=True,
+                    mode=mode,
+                )
+
+            if settings.docling_do_ocr:
+                langs = [
+                    lang.strip()
+                    for lang in settings.docling_ocr_lang.split(",")
+                    if lang.strip()
+                ] or ["en"]
+                opts.ocr_options = EasyOcrOptions(
+                    lang=langs,
+                    confidence_threshold=0.5,
+                )
+
+            device_map = {
+                "auto": AcceleratorDevice.AUTO,
+                "cpu": AcceleratorDevice.CPU,
+                "cuda": AcceleratorDevice.CUDA,
+                "mps": AcceleratorDevice.MPS,
+            }
+            device = device_map.get(
+                settings.docling_device.lower(), AcceleratorDevice.AUTO,
+            )
+            opts.accelerator_options = AcceleratorOptions(
+                num_threads=settings.docling_num_threads,
+                device=device,
+            )
+            opts.document_timeout = settings.docling_timeout_sec
+
+            self._docling_converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=opts),
+                },
+            )
+            log.info(
+                "Docling готов: ocr={} (lang={}), tables={} ({}), device={}, threads={}, timeout={:.0f}s",
+                settings.docling_do_ocr,
+                settings.docling_ocr_lang,
+                settings.docling_do_table_structure,
+                settings.docling_table_mode,
+                settings.docling_device,
+                settings.docling_num_threads,
+                settings.docling_timeout_sec,
+            )
         return self._docling_converter
 
     def _parse_with_docling(self, file_path: Path) -> ParseResult:
@@ -226,14 +298,10 @@ class DocumentParser:
             )
 
     def parse(self, file_path: str | Path, mode: Optional[str] = None) -> ParseResult:
-        """Распарсить документ.
+        """Синхронный парсинг (для CLI / тестов / background job).
 
-        Args:
-            file_path: Путь к файлу
-            mode: Режим парсинга (gemini, docling). None = из конфига.
-
-        Returns:
-            ParseResult с текстом и метаданными
+        Без retry на rate-limit — для async-пайплайна используй parse_async(),
+        где retry реализован через asyncio.sleep, не блокируя worker'ов в thread pool.
         """
         file_path = Path(file_path)
 
@@ -247,58 +315,103 @@ class DocumentParser:
                  file_path.name, mode, file_path.stat().st_size / (1024 * 1024))
 
         if mode == "gemini":
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    return self._parse_with_gemini(file_path)
-                except Exception as e:
-                    error_str = str(e)
-                    # Rate limit — ждём и повторяем
-                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                        wait = 45 * (attempt + 1)  # 45s, 90s, 135s
-                        log.warning(
-                            "Gemini rate limit (попытка {}/{}). Ждём {} сек...",
-                            attempt + 1, max_retries, wait
-                        )
-                        time.sleep(wait)
-                        continue
-                    # Другая ошибка — попробовать docling только если явно доступен
-                    log.warning("Gemini парсинг не удался: {}", e)
-                    try:
-                        return self._parse_with_docling(file_path)
-                    except Exception as docling_err:
-                        log.error("Docling тоже не смог: {}", docling_err)
-                        raise RuntimeError(
-                            f"Парсинг не удался ни через Gemini ({e}), ни через Docling ({docling_err})"
-                        )
-            # Все попытки Gemini исчерпаны — rate limit
-            raise RuntimeError(
-                "Gemini API: дневной лимит исчерпан. Варианты:\n"
-                "1. Подождите до сброса квоты (ежедневно)\n"
-                "2. Создайте новый API ключ: https://aistudio.google.com/apikey\n"
-                "3. Переключитесь на RAG_PARSER_MODE=docling (нужно 4+ ГБ RAM)"
-            )
+            return self._parse_with_gemini(file_path)
         elif mode == "docling":
             return self._parse_with_docling(file_path)
         elif mode == "vision":
-            # Vision LLM парсинг — требует async
             raise NotImplementedError(
                 "Vision LLM парсинг доступен только через parse_async(). "
                 "Используйте: await parser.parse_async(file_path, mode='vision')"
             )
         else:
-            raise ValueError(f"Неизвестный режим парсинга: {mode}. Допустимые: gemini, docling, vision")
+            raise ValueError(
+                f"Неизвестный режим парсинга: {mode}. Допустимые: gemini, docling, vision"
+            )
 
-    async def parse_async(self, file_path: str | Path, mode: Optional[str] = None) -> ParseResult:
-        """Распарсить документ асинхронно."""
+    async def parse_async(
+        self,
+        file_path: str | Path,
+        mode: Optional[str] = None,
+    ) -> ParseResult:
+        """Async-парсинг с корректной обработкой rate-limit через asyncio.sleep.
+
+        Ранее retry жил в синхронном parse() и использовал time.sleep, из-за
+        чего worker'ы в общем thread pool блокировались на 45–135 секунд при
+        429 от Gemini. Теперь retry реализован на async-уровне: ждём
+        кооперативно, thread pool свободен для других задач.
+        """
+        file_path = Path(file_path)
         mode = mode or settings.parser_mode
 
         # Vision LLM — нативно асинхронный
         if mode == "vision":
             return await self._parse_with_vision(file_path)
 
+        if mode == "docling":
+            return await self._run_in_executor(self._parse_with_docling, file_path)
+
+        if mode == "gemini":
+            return await self._parse_gemini_with_retry(file_path)
+
+        # Другие режимы — просто offload в executor
+        return await self._run_in_executor(self.parse, file_path, mode)
+
+    async def _parse_gemini_with_retry(self, file_path: Path) -> ParseResult:
+        """Async-обёртка над _parse_with_gemini с retry на 429.
+
+        На не-429 ошибке — один fallback на Docling (он локальный, не падает
+        от rate-limit). После всех retry и неудачного fallback — raise.
+        """
+        max_retries = 3
+        last_err: Exception | None = None
+
+        for attempt in range(max_retries):
+            try:
+                return await self._run_in_executor(self._parse_with_gemini, file_path)
+            except Exception as e:
+                last_err = e
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+
+                if is_rate_limit and attempt < max_retries - 1:
+                    wait = 45 * (attempt + 1)  # 45s, 90s
+                    log.warning(
+                        "Gemini rate limit (попытка {}/{}). Ждём {} сек (async)...",
+                        attempt + 1, max_retries, wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+                # Не rate-limit — пробуем Docling один раз как fallback
+                if not is_rate_limit:
+                    log.warning("Gemini парсинг не удался ({}), fallback на Docling", e)
+                    try:
+                        return await self._run_in_executor(
+                            self._parse_with_docling, file_path,
+                        )
+                    except Exception as docling_err:
+                        log.error("Docling тоже не смог: {}", docling_err)
+                        raise RuntimeError(
+                            f"Парсинг не удался ни через Gemini ({e}), "
+                            f"ни через Docling ({docling_err})"
+                        )
+
+                # Rate-limit исчерпан
+                break
+
+        raise RuntimeError(
+            f"Gemini API: лимит исчерпан после {max_retries} попыток "
+            f"(последняя ошибка: {last_err}). Варианты:\n"
+            "1. Подождите до сброса квоты (ежедневно)\n"
+            "2. Создайте новый API ключ: https://aistudio.google.com/apikey\n"
+            "3. Переключитесь на RAG_PARSER_MODE=docling (нужно 4+ ГБ RAM)"
+        )
+
+    @staticmethod
+    async def _run_in_executor(func, *args):
+        """Хелпер: offload sync-функции в default thread pool."""
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.parse, file_path, mode)
+        return await loop.run_in_executor(None, func, *args)
 
     async def _parse_with_vision(self, file_path: str | Path) -> ParseResult:
         """Парсинг через Vision LLM (page-as-image)."""

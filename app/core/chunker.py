@@ -1,23 +1,26 @@
 """
-Чанкинг документов — два режима:
+Чанкинг документов.
 
-1. 'markdown' (по умолчанию) — конвертирует документ в Markdown через Docling,
-   затем разбивает по секциям (## заголовкам). Сохраняет таблицы как
-   | col1 | col2 |, код как ```python, заголовки как ## Title.
-   LLM обучены на Markdown — это оптимальный формат.
+Режимы (по умолчанию — 'hybrid'):
 
-2. 'hybrid' — использует Docling HybridChunker + serialize().
-   Таблицы преобразуются в плоский текст: "Выручка, Q4 = 15.2 млрд".
-   Заголовки вставляются как хлебные крошки.
+1. 'hybrid' (рекомендуемый) — Docling HybridChunker с tokenizer'ом
+   активного embedding-провайдера. Итоговый чанк = chunker.contextualize(),
+   что добавляет heading breadcrumbs к тексту для embedding.
+   Метаданные: page_no, headings, element_type берутся из chunk.meta —
+   семантически, не через regex.
 
-Оба режима:
-- Определяют тип элемента (text, table, code, list, formula)
-- Извлекают номера страниц из provenance
-- Привязывают чанк к секции документа
+2. 'markdown' (legacy) — режет Markdown, полученный из Docling, по '##'
+   заголовкам собственным regex-сплиттером. Работает без токенизатора,
+   но теряет page_no и структурные labels. Сохранён ТОЛЬКО потому что
+   на нём основан parent-child режим. См. TODO внутри.
+
+Parent-child режим — пока работает поверх markdown-сплиттера (см. TODO).
+Будет переведён на структуру DoclingDocument в этапе 4.
 """
 
 import re
 import time
+from typing import Optional
 
 from app.config import settings
 from app.models.document import Chunk, ChunkMetadata
@@ -25,39 +28,62 @@ from app.utils.logging import get_logger
 
 log = get_logger("chunker")
 
-# Приблизительный коэффициент: 1 токен ≈ 4 символа (для русского текста ~3)
+# Приблизительный коэффициент: 1 токен ≈ 3 символа (для русского текста).
+# Используется ТОЛЬКО в legacy markdown-сплиттере; hybrid-режим использует
+# реальный токенизатор активного embedding-провайдера.
 CHARS_PER_TOKEN = 3
+
+# Маппинг Docling doc_item.label → наш element_type.
+# Проверяем в этом порядке: более специфичные сначала.
+_LABEL_TO_ELEMENT_TYPE = {
+    "table": "table",
+    "code": "code",
+    "code_block": "code",
+    "formula": "formula",
+    "equation": "formula",
+    "list_item": "list",
+    "figure": "figure",
+    "picture": "figure",
+    "caption": "caption",
+    "footnote": "footnote",
+    "page_header": "header",
+    "page_footer": "footer",
+}
 
 
 class DocumentChunker:
-    """Чанкер документов с поддержкой Markdown и Hybrid режимов."""
+    """Чанкер документов: hybrid (Docling) как основной, markdown как legacy."""
 
     def chunk(
         self,
         docling_document,
         document_id: str,
-        output_format: str = "markdown",
+        output_format: Optional[str] = None,
         include_headers: bool = True,
     ) -> list[Chunk]:
         """Нарезать документ на чанки.
 
         Args:
-            docling_document: Объект DoclingDocument от парсера
+            docling_document: DoclingDocument от парсера
             document_id: ID документа для привязки чанков
-            output_format: Формат чанков:
-                'markdown' — полный Markdown (## заголовки, | таблицы |, ```код```)
-                'hybrid'   — Docling serialize (плоский текст + хлебные крошки)
-            include_headers: (для hybrid) Включать заголовки в текст чанка
+            output_format: 'hybrid' (default) или 'markdown' (legacy).
+                           None = из settings.chunk_output_format (default 'hybrid').
+            include_headers: (для hybrid) Добавлять breadcrumbs заголовков в текст чанка
 
         Returns:
             Список чанков с метаданными
         """
-        if output_format == "markdown":
-            if settings.parent_child_enabled:
-                return self._chunk_parent_child(docling_document, document_id)
-            return self._chunk_markdown(docling_document, document_id)
-        else:
+        fmt = (output_format or getattr(settings, "chunk_output_format", "hybrid")).lower()
+
+        # Parent-child пока использует markdown-сплиттер (TODO: перевести на DoclingDocument)
+        if settings.parent_child_enabled:
+            return self._chunk_parent_child(docling_document, document_id)
+
+        if fmt == "hybrid":
             return self._chunk_hybrid(docling_document, document_id, include_headers)
+        if fmt == "markdown":
+            return self._chunk_markdown(docling_document, document_id)
+        raise ValueError(f"Неизвестный output_format: {fmt}. Ожидается 'hybrid' или 'markdown'.")
 
     # ═══════════════════════════════════════════════════════
     # Parent-Child чанкинг
@@ -148,11 +174,16 @@ class DocumentChunker:
         return all_chunks
 
     # ═══════════════════════════════════════════════════════
-    # Markdown чанкинг (обычный, без parent-child)
+    # LEGACY: Markdown-сплиттер по regex
     # ═══════════════════════════════════════════════════════
+    # Оставлен ТОЛЬКО потому что _chunk_parent_child использует
+    # _split_markdown_by_sections. После перевода parent-child на
+    # структуру DoclingDocument (этап 4 плана) этот блок можно удалить.
+    # Теряет: page_no, точные element_type из doc_items, настоящий
+    # счёт токенов. Не используй для новых чанкингов.
 
     def _chunk_markdown(self, docling_document, document_id: str) -> list[Chunk]:
-        """Конвертировать в Markdown и разбить по секциям."""
+        """[LEGACY] Markdown через Docling → regex-сплит по ## заголовкам."""
         log.info("Чанкинг (markdown) документа {}", document_id)
         start = time.perf_counter()
 
@@ -305,74 +336,125 @@ class DocumentChunker:
     # Hybrid чанкинг (старый режим)
     # ═══════════════════════════════════════════════════════
 
+    def _build_hybrid_chunker(self, max_tokens: Optional[int] = None):
+        """Сконструировать HybridChunker с tokenizer активного провайдера.
+
+        Если у активного embedding-профиля есть tokenizer_spec — используем его.
+        Иначе падаем с понятной ошибкой: нельзя эффективно чанковать без
+        tokenizer'а модели (границы не совпадут с окном embedding).
+
+        max_tokens=None → возьмётся из tokenizer_spec.
+        """
+        from docling.chunking import HybridChunker
+
+        # Ленивый импорт: embedder → провайдер → tokenizer
+        from app.core.embedder import embedder
+
+        tokenizer = embedder.get_tokenizer()
+        if tokenizer is None:
+            raise RuntimeError(
+                "Активный embedding-профиль не сконфигурирован c tokenizer'ом. "
+                "Задай его в config/embedding_profiles.yml (секция tokenizer: "
+                "{type: hf|tiktoken, name: ...}). Пример для BGE-M3: "
+                "name: BAAI/bge-m3. Без этого HybridChunker не знает реальных границ."
+            )
+
+        # Если явный max_tokens не задан — tokenizer принесёт свой
+        if max_tokens is not None:
+            tokenizer.max_tokens = max_tokens
+
+        return HybridChunker(tokenizer=tokenizer, merge_peers=True)
+
+    def _extract_rich_meta(self, dc) -> ChunkMetadata:
+        """Извлечь page_no, headings, element_type из chunk.meta DoclingDocument."""
+        meta = ChunkMetadata(char_count=0)  # char_count проставим снаружи
+
+        try:
+            if not getattr(dc, "meta", None):
+                return meta
+
+            # Heading breadcrumbs
+            if getattr(dc.meta, "headings", None):
+                meta.section = " > ".join(str(h) for h in dc.meta.headings)
+
+            # Первый page_no из provenance любого doc_item
+            doc_items = getattr(dc.meta, "doc_items", None) or []
+            labels: list[str] = []
+            for di in doc_items:
+                label = str(getattr(di, "label", "") or "")
+                if label:
+                    labels.append(label.lower())
+
+                if meta.page is None:
+                    prov = getattr(di, "prov", None) or []
+                    for p in prov:
+                        page_no = getattr(p, "page_no", None)
+                        if page_no is not None:
+                            meta.page = int(page_no)
+                            break
+
+            # Element type: самый специфичный из doc_items (table > code > formula > list > text)
+            priority = ("table", "code", "formula", "equation", "list_item",
+                        "figure", "picture", "caption", "footnote")
+            chosen = "text"
+            for candidate in priority:
+                if candidate in labels:
+                    chosen = _LABEL_TO_ELEMENT_TYPE.get(candidate, "text")
+                    break
+            meta.element_type = chosen
+
+            # Fallback на meta.page (если prov не дал)
+            if meta.page is None:
+                page = getattr(dc.meta, "page", None)
+                if page is not None:
+                    meta.page = int(page)
+
+        except Exception as e:
+            log.debug("Ошибка извлечения метаданных чанка: {}", e)
+
+        return meta
+
     def _chunk_hybrid(
-        self, docling_document, document_id: str, include_headers: bool = True
+        self, docling_document, document_id: str, include_headers: bool = True,
     ) -> list[Chunk]:
-        """Docling HybridChunker + serialize()."""
+        """Docling HybridChunker с токенизатором активного провайдера.
+
+        Итоговый текст чанка = chunker.contextualize(dc) если include_headers,
+        иначе dc.text. contextualize() добавляет breadcrumbs заголовков
+        перед текстом — это рекомендуемый формат для embedding.
+        """
         log.info("Чанкинг (hybrid) документа {}", document_id)
         start = time.perf_counter()
 
-        from docling.chunking import HybridChunker
-
-        hybrid_chunker = HybridChunker(
+        hybrid_chunker = self._build_hybrid_chunker(
             max_tokens=settings.chunk_max_tokens,
         )
 
         docling_chunks = list(hybrid_chunker.chunk(docling_document))
 
         chunks = []
-        for i, dc in enumerate(docling_chunks):
+        for dc in docling_chunks:
+            # Контекстуализация: добавляет heading-breadcrumbs к тексту
             if include_headers:
-                text = hybrid_chunker.serialize(dc)
+                try:
+                    text = hybrid_chunker.contextualize(chunk=dc)
+                except Exception:
+                    # В некоторых версиях метод называется serialize()
+                    text = hybrid_chunker.serialize(dc)
             else:
                 text = dc.text
 
             if not text or not text.strip():
                 continue
 
-            meta = ChunkMetadata(char_count=len(text))
+            meta = self._extract_rich_meta(dc)
+            meta.char_count = len(text)
 
-            try:
-                if hasattr(dc, "meta") and dc.meta:
-                    if hasattr(dc.meta, "headings") and dc.meta.headings:
-                        meta.section = " > ".join(dc.meta.headings)
-
-                    if hasattr(dc.meta, "doc_items") and dc.meta.doc_items:
-                        element_types = set()
-                        for di in dc.meta.doc_items:
-                            label = str(getattr(di, "label", "text"))
-                            element_types.add(label)
-
-                            if meta.page is None and hasattr(di, "prov"):
-                                for prov_item in (di.prov or []):
-                                    if hasattr(prov_item, "page_no") and prov_item.page_no is not None:
-                                        meta.page = prov_item.page_no
-                                        break
-
-                        if "table" in element_types:
-                            meta.element_type = "table"
-                        elif "code" in element_types:
-                            meta.element_type = "code"
-                        elif "list_item" in element_types:
-                            meta.element_type = "list"
-                        elif any("formula" in et or "equation" in et for et in element_types):
-                            meta.element_type = "formula"
-                        else:
-                            meta.element_type = "text"
-
-                    if meta.page is None:
-                        if hasattr(dc.meta, "page") and dc.meta.page is not None:
-                            meta.page = dc.meta.page
-
-            except Exception as e:
-                log.debug("Ошибка извлечения метаданных чанка {}: {}", i, e)
-
-            chunk = Chunk(
+            chunks.append(Chunk(
                 document_id=document_id,
                 text=text,
                 metadata=meta,
-            )
-            chunks.append(chunk)
+            ))
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         self._log_stats(chunks, elapsed_ms, "hybrid")

@@ -20,6 +20,66 @@ class Settings(BaseSettings):
     grpc_port: int = Field(default=50051, description="Порт gRPC сервера")
     debug: bool = False
 
+    # === Логирование ===
+    log_format: str = Field(
+        default="text",
+        description=(
+            "Формат логов: 'text' (цветной, человекочитаемый) или 'json' "
+            "(структурный, под Loki/ELK/Datadog)."
+        ),
+    )
+    log_level: str = Field(
+        default="INFO",
+        description="Уровень: DEBUG, INFO, WARNING, ERROR, CRITICAL",
+    )
+    log_file_enabled: bool = Field(
+        default=True,
+        description="Писать ли логи в файл (./data/logs/rag-llm_<date>.log)",
+    )
+    log_file_dir: str = Field(
+        default="./data/logs",
+        description="Директория для файловых логов",
+    )
+    log_file_rotation: str = Field(
+        default="10 MB",
+        description="Ротация логов по размеру (формат loguru: '10 MB', '1 day')",
+    )
+    log_file_retention: str = Field(
+        default="7 days",
+        description="Сколько хранить ротированные файлы (формат loguru)",
+    )
+
+    # === Безопасность ===
+    cors_allow_origins: str = Field(
+        default="http://localhost:3000,http://localhost:8000",
+        description=(
+            "Разрешённые CORS origins (через запятую). "
+            "Используй '*' только для локальной разработки."
+        ),
+    )
+    api_keys: str = Field(
+        default="",
+        description=(
+            "Валидные ключи для header X-API-Key (через запятую). "
+            "Пусто = аутентификация отключена (dev mode)."
+        ),
+    )
+    max_upload_size_mb: int = Field(
+        default=50,
+        description="Максимальный размер загружаемого файла в МБ (0 = без лимита)",
+    )
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        raw = self.cors_allow_origins.strip()
+        if raw == "*":
+            return ["*"]
+        return [o.strip() for o in raw.split(",") if o.strip()]
+
+    @property
+    def api_keys_set(self) -> set[str]:
+        return {k.strip() for k in self.api_keys.split(",") if k.strip()}
+
     # === LLM Провайдер ===
     # Бесплатные варианты:
     #   Gemini:  base_url = https://generativelanguage.googleapis.com/v1beta/openai
@@ -52,32 +112,107 @@ class Settings(BaseSettings):
         default=0.7,
         description="Температура генерации (0.0 - 1.0)"
     )
+    llm_anthropic_cache_control: bool = Field(
+        default=False,
+        description=(
+            "Размечать cache_control: ephemeral на системном промпте и блоке "
+            "контекста в messages. Нужно ТОЛЬКО для Anthropic API (Claude). "
+            "Для OpenAI/Gemini/vLLM кеш срабатывает автоматически — флаг "
+            "оставь False."
+        ),
+    )
+    llm_cache_min_tokens: int = Field(
+        default=1024,
+        description=(
+            "Минимальная оценочная длина блока для маркировки cache_control "
+            "(Anthropic требует ≥1024 токенов). ~4 символа на токен."
+        ),
+    )
 
     # === Embedding Провайдер ===
-    # Бесплатные варианты:
-    #   Gemini:  base_url = https://generativelanguage.googleapis.com/v1beta/openai
-    #            model = text-embedding-004   (бесплатно)
-    #   Jina:    base_url = https://api.jina.ai/v1
-    #            model = jina-embeddings-v3   (1M tokens free)
+    # Основной способ конфигурации — профили в config/embedding_profiles.yml.
+    # Выбор активного профиля — RAG_EMBEDDING_PROFILE=<имя>.
+    # Плоские поля ниже (embedding_provider, embedding_base_url, ...) сохранены
+    # для обратной совместимости: если RAG_EMBEDDING_PROFILE не задан и в YAML
+    # нет профиля 'default', профиль будет собран из них.
+    embedding_profile: str = Field(
+        default="",
+        description=(
+            "Имя профиля из embedding_profiles.yml "
+            "(например: gemini-free, vllm-bge, ollama-nomic, openai-large, jina-v3). "
+            "Пусто = использовать профиль 'default' из YAML или fallback на плоские поля."
+        ),
+    )
+    embedding_profiles_path: str = Field(
+        default="config/embedding_profiles.yml",
+        description="Путь к YAML-файлу с embedding-профилями",
+    )
+
+    # --- Legacy плоские поля (backward-compat) ---
     embedding_provider: str = Field(
         default="gemini",
-        description="Провайдер Embeddings: gemini, jina, vllm, openai, custom"
+        description="[legacy] Провайдер Embeddings: gemini, jina, vllm, openai, custom"
     )
     embedding_base_url: str = Field(
         default="https://generativelanguage.googleapis.com/v1beta/openai",
-        description="Base URL для Embedding API"
+        description="[legacy] Base URL для Embedding API"
     )
     embedding_api_key: str = Field(
         default="",
-        description="API ключ для Embedding (может совпадать с LLM)"
+        description="[legacy] API ключ для Embedding (может совпадать с LLM)"
     )
     embedding_model: str = Field(
         default="text-embedding-004",
-        description="Название embedding модели"
+        description="[legacy] Название embedding модели"
     )
     embedding_dimensions: int = Field(
         default=768,
-        description="Размерность embedding вектора"
+        description="[legacy] Размерность embedding вектора"
+    )
+
+    # === Tracing ===
+    trace_db_path: str = Field(
+        default="./data/traces.sqlite",
+        description=(
+            "Путь к SQLite-файлу с трейсами запросов. "
+            "Ранее трейсы жили только в памяти (deque maxlen=100) и терялись "
+            "при рестарте — теперь персистентны."
+        ),
+    )
+    trace_memory_cache_size: int = Field(
+        default=200,
+        description=(
+            "Сколько последних трейсов держать в памяти (LRU) для быстрого "
+            "get_trace без обращения к SQLite"
+        ),
+    )
+    trace_retention_days: int = Field(
+        default=30,
+        description=(
+            "Сколько дней хранить завершённые трейсы в SQLite. 0 = вечно. "
+            "Чистка запускается lazy раз в сутки при end_trace()."
+        ),
+    )
+
+    # === BM25 keyword search ===
+    bm25_enabled: bool = Field(
+        default=True,
+        description=(
+            "Использовать BM25 для keyword-поиска. False = старый substring-match "
+            "(оставлен как fallback / для сравнения качества)"
+        ),
+    )
+    bm25_persist_dir: str = Field(
+        default="./data/bm25",
+        description="Директория для BM25-индексов (per collection)",
+    )
+    bm25_stemmer_lang: str = Field(
+        default="russian",
+        description=(
+            "Язык стеммера для BM25 (snowballstemmer): russian, english, german, "
+            "french, spanish, italian и др. Для RU+EN корпусов 'russian' — OK, "
+            "английские слова останутся без стемминга, но будут матчиться точно."
+        ),
     )
 
     # === ChromaDB ===
@@ -99,6 +234,36 @@ class Settings(BaseSettings):
         default="gemini",
         description="Режим парсинга: gemini (облако), docling (локально), vision (Vision LLM)"
     )
+
+    # --- Docling PDF pipeline ---
+    docling_do_ocr: bool = Field(
+        default=True,
+        description="Включить OCR (для сканов). Требует EasyOCR — Docling скачает модели.",
+    )
+    docling_ocr_lang: str = Field(
+        default="en,ru",
+        description="Языки OCR через запятую (коды EasyOCR): en,ru,de,fr,...",
+    )
+    docling_do_table_structure: bool = Field(
+        default=True,
+        description="Включить TableFormer — восстановление структуры таблиц",
+    )
+    docling_table_mode: str = Field(
+        default="accurate",
+        description="Режим TableFormer: accurate (качество) или fast (скорость)",
+    )
+    docling_device: str = Field(
+        default="auto",
+        description="Устройство ускорения: auto, cpu, cuda, mps",
+    )
+    docling_num_threads: int = Field(
+        default=4,
+        description="Количество CPU-потоков для Docling",
+    )
+    docling_timeout_sec: float = Field(
+        default=300.0,
+        description="Максимум секунд на один документ (Docling абортит длинный парсинг)",
+    )
     vision_llm_base_url: str = Field(
         default="",
         description="Base URL для Vision LLM (для parser_mode=vision)"
@@ -114,6 +279,13 @@ class Settings(BaseSettings):
     texts_dir: str = Field(
         default="./data/texts",
         description="Директория для хранения извлечённых текстов"
+    )
+    chunk_output_format: str = Field(
+        default="hybrid",
+        description=(
+            "Формат чанков: 'hybrid' (Docling HybridChunker + tokenizer активного "
+            "embedding-провайдера, рекомендуется) или 'markdown' (legacy regex)"
+        ),
     )
     chunk_max_tokens: int = Field(
         default=512,

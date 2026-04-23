@@ -122,6 +122,8 @@ class Generator:
             prompt_tokens=llm_response.prompt_tokens,
             completion_tokens=llm_response.completion_tokens,
             total_tokens=llm_response.total_tokens,
+            cached_prompt_tokens=llm_response.cached_prompt_tokens,
+            cache_creation_tokens=llm_response.cache_creation_tokens,
             generation_time_ms=total_ms,
             llm_time_ms=llm_response.generation_time_ms,
         )
@@ -140,6 +142,8 @@ class GenerationResult:
         total_tokens: int,
         generation_time_ms: float,
         llm_time_ms: float,
+        cached_prompt_tokens: int = 0,
+        cache_creation_tokens: int = 0,
     ):
         self.answer = answer
         self.prompt = prompt
@@ -149,6 +153,16 @@ class GenerationResult:
         self.total_tokens = total_tokens
         self.generation_time_ms = generation_time_ms
         self.llm_time_ms = llm_time_ms
+        # Cache-метрики (0 если провайдер их не вернул или кеш не сработал).
+        self.cached_prompt_tokens = cached_prompt_tokens
+        self.cache_creation_tokens = cache_creation_tokens
+
+    @property
+    def cache_hit_ratio(self) -> float:
+        """Доля токенов prompt'а, прочитанных из кеша (0.0–1.0)."""
+        if not self.prompt_tokens:
+            return 0.0
+        return self.cached_prompt_tokens / self.prompt_tokens
 
 
 # Глобальный экземпляр

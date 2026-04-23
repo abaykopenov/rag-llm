@@ -1,0 +1,94 @@
+# Embedding-профили для RAG-LLM.
+#
+# Выбор активного профиля:
+#   RAG_EMBEDDING_PROFILE=vllm-bge
+#
+# Ключи:
+#   provider          — "gemini" или "openai_compat"
+#                       (openai_compat работает с OpenAI, Jina, vLLM, Ollama, LM Studio, TGI, ...)
+#   model             — имя модели, которое уйдёт в API ("text-embedding-3-large", "BAAI/bge-m3", ...)
+#   dim               — размерность вектора (должна совпадать с реальной, иначе ChromaDB упадёт)
+#   max_input_tokens  — максимальная длина входа модели (используется чанкером)
+#   base_url          — только для openai_compat
+#   api_key_env       — имя env-переменной с ключом (предпочтительнее `api_key`)
+#   api_key           — ключ напрямую (для vLLM/Ollama без аутентификации оставить пустым)
+#   batch_size        — размер батча при запросе embedding (по умолчанию 32)
+#   tokenizer         — токенизатор для HybridChunker (Docling)
+#     type            — "hf" (HuggingFace AutoTokenizer), "tiktoken", или "none"
+#     name            — имя модели/энкодинга
+#     max_tokens      — лимит, передаваемый в HybridChunker
+#
+# Любое поле можно не указывать — возьмётся дефолт из base.py.
+
+profiles:
+
+  # ─── Бесплатный Gemini (для старта, есть дневные лимиты) ──────────
+  gemini-free:
+    provider: gemini
+    model: text-embedding-004
+    dim: 768
+    max_input_tokens: 2048
+    api_key_env: RAG_LLM_API_KEY    # тот же ключ, что и у LLM-генерации
+    batch_size: 50
+    tokenizer:
+      # У Gemini нет публичного HF-токенизатора. Используем мультиязычный MPNet
+      # как proxy — погрешность ~5–10%, для чанкинга достаточно.
+      type: hf
+      name: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      max_tokens: 512
+
+  # ─── vLLM с BGE-M3 (локально, 1024 dim, мультиязычный, рекомендуется) ──
+  vllm-bge:
+    provider: openai_compat
+    base_url: http://localhost:8001/v1
+    model: BAAI/bge-m3
+    dim: 1024
+    max_input_tokens: 8192
+    api_key_env: RAG_EMBEDDING_API_KEY   # для vLLM обычно "EMPTY", но нужен
+    batch_size: 64
+    tokenizer:
+      type: hf
+      name: BAAI/bge-m3
+      max_tokens: 512
+
+  # ─── Ollama локальный (с nomic-embed-text) ─────────────────────────
+  ollama-nomic:
+    provider: openai_compat
+    base_url: http://localhost:11434/v1
+    model: nomic-embed-text
+    dim: 768
+    max_input_tokens: 2048
+    api_key: "ollama"  # Ollama принимает любой не-пустой ключ
+    batch_size: 32
+    tokenizer:
+      type: hf
+      name: nomic-ai/nomic-embed-text-v1.5
+      max_tokens: 512
+
+  # ─── OpenAI text-embedding-3-large (production, платный) ──────────
+  openai-large:
+    provider: openai_compat
+    base_url: https://api.openai.com/v1
+    model: text-embedding-3-large
+    dim: 3072
+    max_input_tokens: 8191
+    api_key_env: OPENAI_API_KEY
+    batch_size: 256
+    tokenizer:
+      type: tiktoken
+      name: cl100k_base
+      max_tokens: 512
+
+  # ─── Jina Embeddings v3 (1M токенов/мес бесплатно, мультиязычный) ──
+  jina-v3:
+    provider: openai_compat
+    base_url: https://api.jina.ai/v1
+    model: jina-embeddings-v3
+    dim: 1024
+    max_input_tokens: 8192
+    api_key_env: RAG_JINA_API_KEY
+    batch_size: 32
+    tokenizer:
+      type: hf
+      name: jinaai/jina-embeddings-v3
+      max_tokens: 512
